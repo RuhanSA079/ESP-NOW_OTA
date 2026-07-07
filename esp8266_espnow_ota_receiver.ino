@@ -4,7 +4,8 @@
 //
 // Boot sequence:
 //   1. Send ESP-NOW beacon every 250ms for BEACON_DURATION_MS (3s)
-//   2. If OTA offer received: accept, receive chunks, flash, reboot
+//   2. If OTA offer received: reject if device_type doesn't match
+//      OTA_TYPE_TAG below, else accept, receive chunks, flash, reboot
 //   3. If no offer within timeout: call startApplication()
 //
 // IMPORTANT – compile with an OTA-capable flash layout, e.g.:
@@ -68,6 +69,7 @@ typedef struct __attribute__((packed)) {
   uint16_t chunk_size;
   uint32_t offered_version;  // version of the firmware being offered
   uint8_t  flags;            // OTA_FLAG_FORCE (0x01) = skip version check
+  char     device_type[12];  // null-padded target type, e.g. "ESP-NODE"
 } ota_offer_t;
 
 typedef struct __attribute__((packed)) {
@@ -100,6 +102,21 @@ static uint32_t getVersion() {
        | ((uint32_t)OTA_VERSION_TAG[5] << 8)
        | ((uint32_t)OTA_VERSION_TAG[6] << 16)
        | ((uint32_t)OTA_VERSION_TAG[7] << 24);
+}
+
+// Device-type tag embedded in binary — pc_ota_tool.py scans for 'OTAT' to
+// extract the target type and include it in the OTA offer.  The receiver
+// rejects any offer whose device_type field does not match this tag.
+// Must be ≤ 12 printable ASCII chars; remainder is null-padded.
+volatile const uint8_t OTA_TYPE_TAG[] = {
+  'O', 'T', 'A', 'T',
+  'E', 'S', 'P', '-', 'N', 'O', 'D', 'E', 0, 0, 0, 0
+};
+
+// Reads OTA_TYPE_TAG back at runtime so the linker's --gc-sections can't
+// discard it as dead data (it's otherwise write-only).
+static const char *getDeviceType() {
+  return (const char *)&OTA_TYPE_TAG[4];
 }
 
 // ======================================================
@@ -163,7 +180,8 @@ static void sendSimple(uint8_t *mac, uint8_t type, uint8_t seq = 0) {
   sendMsg(mac, &m, 0);
 }
 
-// reason: 0x00 = generic (Update.begin failed), 0x01 = same version
+// reason: 0x00 = generic (Update.begin failed), 0x01 = same version,
+//         0x02 = device_type mismatch
 static void sendReject(uint8_t *mac, uint8_t reason) {
   espnow_msg_t m;
   m.type       = MSG_OTA_REJECT;
@@ -180,7 +198,7 @@ static void sendBeacon() {
 
   beacon_info_t *b   = (beacon_info_t *)m.payload;
   b->firmware_version = getVersion();
-  strncpy(b->device_name, "ESP-NODE", sizeof(b->device_name));
+  strncpy(b->device_name, getDeviceType(), sizeof(b->device_name));
   m.len = sizeof(beacon_info_t);
 
   uint8_t bc[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
@@ -215,11 +233,20 @@ static void processMessage() {
         memcpy(g_sender_mac, g_msg_mac, 6);
         espnowAddPeer(g_sender_mac);
 
-        Serial.printf("[OTA] Offer: v%u, %u bytes, CRC32=0x%08X\n",
-                      off->offered_version, g_fw_size, g_fw_crc);
+        char offType[13] = {};
+        memcpy(offType, off->device_type, 12);
+        Serial.printf("[OTA] Offer: v%u, %u bytes, type '%s', CRC32=0x%08X\n",
+                      off->offered_version, g_fw_size, offType, g_fw_crc);
 
         bool force = (off->flags & OTA_FLAG_FORCE) != 0;
-        if (!force && off->offered_version == getVersion()) {
+        char ownType[12] = {};
+        strncpy(ownType, getDeviceType(), 12);
+        if (memcmp(off->device_type, ownType, 12) != 0) {
+          Serial.printf("[OTA] Type mismatch: got '%s', expected '%s', rejecting\n",
+                        offType, getDeviceType());
+          sendReject(g_sender_mac, 0x02);  // 0x02 = device_type mismatch
+          g_phase = OTA_SKIP;
+        } else if (!force && off->offered_version == getVersion()) {
           Serial.printf("[OTA] Already running v%u, rejecting\n", getVersion());
           sendReject(g_sender_mac, 0x01);  // 0x01 = same version
           g_phase = OTA_SKIP;

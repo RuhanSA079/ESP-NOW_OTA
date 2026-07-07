@@ -1,96 +1,121 @@
 // ============================================================
 // esp8266_espnow_ota_sender.ino
-// ESP-NOW OTA Transmitter — real-time streaming, no SPIFFS
+// ESP-NOW OTA Transmitter — per-device independent streaming
+//
+// Each accepting device gets its own unicast chunk stream.
+// Devices advance at their own pace; a slow/retry-heavy device
+// does not hold back any other device.
+//
+// Protocol (PC ↔ Sender, binary framing AA cmd lenH lenL [data]):
+//
+//   CMD_INIT      0x01  [fw_size:4LE][crc32:4LE][version:4LE][flags:1][device_type:12][discovery_ms:4LE]
+//   CMD_CHUNK_FOR 0x05  [device_idx:1][chunk_bytes:<=200]
+//   CMD_STATUS    0x03  (no payload)
+//   CMD_CANCEL    0x04  (no payload)
+//
+//   RSP_OK           0x01  CMD_INIT accepted
+//   RSP_ERROR        0x02  [error_code:1]
+//   RSP_DEVICE_FOUND 0x03  [device_idx:1][mac:6]  device accepted offer
+//   RSP_VERSION_MATCH 0x06 [mac:6]  device already current
+//   RSP_TYPE_MISMATCH 0x09 [mac:6]  device rejected — wrong firmware type
+//   RSP_NEED_CHUNK   0x07  [device_idx:1][offset:4LE]  send this chunk next
+//   RSP_DEVICE_DONE  0x08  [device_idx:1][status:1]  0=ok, else flash error
+//   RSP_COMPLETE     0x05  all devices finished (success or not)
 //
 // Flow:
-//   1. PC sends CMD_INIT  (fw_size + crc32) → start listening
-//   2. Target boots, beacons → offer sent, target accepts
-//   3. Sender sends RSP_DEVICE_FOUND + RSP_READY_DATA to PC
-//   4. PC sends CMD_DATA chunk → sender forwards via ESP-NOW
-//   5. Target ACKs → sender sends RSP_READY_DATA → repeat
-//   6. After last chunk ACK → sender sends MSG_OTA_END to target
-//   7. Target flashes, reboots → sender sends RSP_COMPLETE to PC
+//   1. PC sends CMD_INIT, sender opens a discovery_ms beacon window (PC-supplied)
+//   2. Sender broadcasts offer; devices accept/reject
+//   3. RSP_DEVICE_FOUND [idx][mac] sent per accepting device
+//   4. Sender begins sending RSP_NEED_CHUNK for each device independently
+//   5. PC responds with CMD_CHUNK_FOR for each request (reactive, event-driven)
+//   6. Sender unicasts chunk to device, waits for MSG_OTA_ACK
+//   7. On ACK: advance device, send next RSP_NEED_CHUNK; repeat until done
+//   8. RSP_DEVICE_DONE sent when each device finishes flashing
+//   9. RSP_COMPLETE when all devices have reported done/error
 //
 // Board:    ESP8266 (NodeMCU / ESP-12E/F)
-// Flash:    any layout; SPIFFS not used
 // Requires: espnow.h (built into ESP8266 Arduino core)
 // ============================================================
 
 #include <ESP8266WiFi.h>
 #include <espnow.h>
+#include <math.h>
 extern "C" {
-  #include <user_interface.h>  // wifi_set_channel()
+  #include <user_interface.h>
 }
 
-// ======================================================
-// Protocol constants  (must match receiver)
-// ======================================================
+// ── Protocol constants ────────────────────────────────────────────────────────
 #define ESPNOW_CHANNEL   1
-#define CHUNK_DATA_SIZE  200   // payload bytes per ESP-NOW data packet
+#define CHUNK_DATA_SIZE  200
 
-// ESP-NOW message types
-#define MSG_BEACON       0x01  // Target  -> broadcast
-#define MSG_OTA_OFFER    0x02  // Sender  -> target
-#define MSG_OTA_ACCEPT   0x03  // Target  -> sender
-#define MSG_OTA_REJECT   0x04  // Target  -> sender
-#define MSG_OTA_DATA     0x05  // Sender  -> target
-#define MSG_OTA_ACK      0x06  // Target  -> sender
-#define MSG_OTA_NAK      0x07  // Target  -> sender
-#define MSG_OTA_END      0x08  // Sender  -> target (all chunks delivered)
-#define MSG_OTA_DONE     0x09  // Target  -> sender (flash result)
-#define MSG_OTA_ERROR    0x0A  // Either direction
+#define MSG_BEACON       0x01
+#define MSG_OTA_OFFER    0x02
+#define MSG_OTA_ACCEPT   0x03
+#define MSG_OTA_REJECT   0x04
+#define MSG_OTA_DATA     0x05
+#define MSG_OTA_ACK      0x06
+#define MSG_OTA_NAK      0x07
+#define MSG_OTA_END      0x08
+#define MSG_OTA_DONE     0x09
+#define MSG_OTA_ERROR    0x0A
 
-// Serial framing
-#define SERIAL_START     0xAA  // PC -> Sender
-#define SERIAL_RESP      0xBB  // Sender -> PC
+#define SERIAL_START     0xAA
+#define SERIAL_RESP      0xBB
 
-// OTA offer flags
-#define OTA_FLAG_FORCE   0x01  // skip version check on target
+#define OTA_FLAG_FORCE   0x01
 
-// Commands (PC -> Sender)
-#define CMD_INIT         0x01  // Start session: [fw_size:4LE][crc32:4LE][version:4LE][flags:1]
-#define CMD_DATA         0x02  // Next chunk: [raw bytes, CHUNK_DATA_SIZE max]
-#define CMD_STATUS       0x03  // Query (no payload)
-#define CMD_CANCEL       0x04  // Abort (no payload)
+#define CMD_INIT         0x01
+#define CMD_CHUNK_FOR    0x05  // [device_idx:1][data:N]
+#define CMD_STATUS       0x03
+#define CMD_CANCEL       0x04
 
-// Responses (Sender -> PC)
-#define RSP_OK            0x01  // CMD_INIT accepted
-#define RSP_ERROR         0x02  // [error_code:1]
-#define RSP_DEVICE_FOUND  0x03  // Target detected and accepted: [mac:6]
-#define RSP_READY_DATA    0x04  // Send next CMD_DATA chunk now
-#define RSP_COMPLETE      0x05  // OTA finished successfully
-#define RSP_VERSION_MATCH 0x06  // Target already runs this version: [mac:6]
+#define RSP_OK            0x01
+#define RSP_ERROR         0x02
+#define RSP_DEVICE_FOUND  0x03  // [device_idx:1][mac:6]
+#define RSP_COMPLETE      0x05
+#define RSP_VERSION_MATCH 0x06
+#define RSP_NEED_CHUNK    0x07  // [device_idx:1][offset:4LE]
+#define RSP_DEVICE_DONE   0x08  // [device_idx:1][status:1]
+#define RSP_TYPE_MISMATCH 0x09  // [mac:6]  device rejected wrong firmware type
 
-// Error codes
 #define ERR_ESPNOW       0x01
 #define ERR_TIMEOUT      0x02
 #define ERR_REJECTED     0x03
-#define ERR_CRC          0x04  // (reserved; CRC verified by target's Update lib)
+#define ERR_CRC          0x04
 #define ERR_BUSY         0x05
 #define ERR_TARGET_FLASH 0x06
 
-// Timing
-#define MAX_RETRIES       5
-#define ACK_TIMEOUT_MS    2000
-#define OFFER_TIMEOUT_MS  5000
-#define DONE_TIMEOUT_MS   20000  // Update.end() can be slow
+#define MAX_PEERS            5
+#define DISCOVERY_WINDOW_MS  2500  // default; PC overrides via CMD_INIT discovery_ms field
+#define DISCOVERY_SETTLE_MS  800   // time to wait for more peers after the 1st is found —
+                                    // must stay well under the target's own OTA_WINDOW_MS
+                                    // reply window, or it'll have given up listening by
+                                    // the time the offer goes out
+#define OFFER_COLLECT_MS     1500
+#define MAX_RETRIES          5
+#define ACK_TIMEOUT_MS       2000
+#define PC_CHUNK_TIMEOUT_MS  10000  // timeout waiting for CMD_CHUNK_FOR
+#define DONE_TIMEOUT_MS      20000
 
-// ======================================================
-// Packet structures  (packed, shared with receiver)
-// ======================================================
+#define PIN_LED           2
+#define BREATHE_PERIOD_MS 2000
+#define CHUNK_FLASH_MS    40
+
+// ── Packet structures ─────────────────────────────────────────────────────────
 typedef struct __attribute__((packed)) {
   uint8_t  type;
   uint8_t  seq;
   uint16_t len;
-  uint8_t  payload[244];  // 4+244 = 248 ≤ 250 (ESP-NOW hard limit)
+  uint8_t  payload[244];
 } espnow_msg_t;
 
 typedef struct __attribute__((packed)) {
   uint32_t firmware_size;
   uint32_t crc32;
   uint16_t chunk_size;
-  uint32_t offered_version;  // version of the firmware being offered
-  uint8_t  flags;            // OTA_FLAG_FORCE (0x01) = skip version check
+  uint32_t offered_version;
+  uint8_t  flags;
+  char     device_type[12];   // null-padded target type e.g. "TX-NODE"
 } ota_offer_t;
 
 typedef struct __attribute__((packed)) {
@@ -104,63 +129,78 @@ typedef struct __attribute__((packed)) {
   char     device_name[12];
 } beacon_info_t;
 
-// ======================================================
-// State machine
-// ======================================================
-enum SenderState {
-  S_IDLE,           // waiting for CMD_INIT
-  S_WAIT_DEVICE,    // listening for target beacon
-  S_OFFERING,       // offer sent, waiting accept/reject
-  S_WAIT_PC_CHUNK,  // ready, waiting for CMD_DATA
-  S_WAIT_ACK,       // chunk forwarded via ESP-NOW, waiting ACK
-  S_WAIT_DONE,      // MSG_OTA_END sent, waiting MSG_OTA_DONE
+// ── Per-device state ──────────────────────────────────────────────────────────
+enum PeerPhase : uint8_t {
+  PEER_WAIT_OFFER,   // in offering phase, waiting for accept/reject
+  PEER_NEED_CHUNK,   // chunk ack'd (or fresh start), ready for next request
+  PEER_WAIT_PC,      // RSP_NEED_CHUNK sent, waiting CMD_CHUNK_FOR from PC
+  PEER_WAIT_ACK,     // chunk unicast to device, waiting MSG_OTA_ACK
+  PEER_SEND_END,     // last chunk ack'd, need to send MSG_OTA_END
+  PEER_WAIT_DONE,    // MSG_OTA_END sent, waiting MSG_OTA_DONE
+  PEER_DONE,         // completed
+  PEER_ERROR,        // failed
 };
 
-// ======================================================
-// Globals
-// ======================================================
-static SenderState g_state          = S_IDLE;
-static uint8_t     g_peer_mac[6]    = {};
-static bool        g_device_found   = false;
-static bool        g_offer_accepted = false;
-static bool        g_offer_rejected = false;
-static uint8_t     g_reject_reason  = 0;   // reason byte from MSG_OTA_REJECT
-static bool        g_ack_received   = false;
-static bool        g_nak_received   = false;
-static bool        g_ota_done       = false;
-static uint8_t     g_done_status    = 0;
-static uint8_t     g_seq            = 0;
+struct OtaPeer {
+  uint8_t   mac[6];
+  bool      active;       // accepted the offer
+  bool      responded;    // accepted or rejected (for offer timeout logic)
+  PeerPhase phase;
+
+  // Independent chunk stream for this device
+  uint32_t  bytes_acked;
+  uint8_t   seq;
+  uint8_t   chunk_buf[CHUNK_DATA_SIZE];
+  uint16_t  chunk_len;
+  uint32_t  chunk_offset;
+  uint8_t   retries;
+  uint32_t  timer;
+  uint8_t   done_status;
+};
+
+// ── Global state ──────────────────────────────────────────────────────────────
+enum SenderState {
+  S_IDLE,
+  S_DISCOVERY,
+  S_OFFERING,
+  S_STREAMING,   // per-device state machines run here
+};
+
+static SenderState g_state        = S_IDLE;
+static OtaPeer     g_peers[MAX_PEERS] = {};
+static uint8_t     g_peer_count   = 0;
+static uint8_t     g_active_count = 0;
+static bool        g_pc_busy      = false;  // RSP_NEED_CHUNK sent, awaiting CMD_CHUNK_FOR
+static uint32_t    g_timer        = 0;
+static uint32_t    g_first_peer_ms = 0;  // millis() when the 1st peer of this session was found
+
 static uint32_t    g_firmware_size    = 0;
 static uint32_t    g_firmware_crc     = 0;
-static uint32_t    g_firmware_version = 0;  // version of firmware being offered
-static uint8_t     g_firmware_flags   = 0;  // OTA_FLAG_FORCE etc.
-static uint32_t    g_bytes_acked    = 0;  // confirmed by target
-static uint32_t    g_timer          = 0;
-static uint8_t     g_retries        = 0;
+static uint32_t    g_firmware_version = 0;
+static uint8_t     g_firmware_flags   = 0;
+static char        g_firmware_type[12] = {};  // null-padded, from CMD_INIT
+static uint32_t    g_discovery_window_ms = DISCOVERY_WINDOW_MS;  // from CMD_INIT
 
-// Single-chunk buffer — all we ever keep in RAM
-static uint8_t  g_chunk_buf[CHUNK_DATA_SIZE];
-static uint16_t g_chunk_len    = 0;
-static uint32_t g_chunk_offset = 0;
+static uint32_t    g_flash_until  = 0;  // LED flash timestamp
 
-// ESP-NOW receive staging  (ISR -> main loop)
+// ESP-NOW receive staging
 static volatile bool g_msg_pending = false;
 static uint8_t       g_msg_mac[6];
 static uint8_t       g_msg_buf[250];
 static uint8_t       g_msg_len;
 
-// Serial frame parser
+// Serial parser
 enum SerialParse { SP_IDLE, SP_CMD, SP_LEN_H, SP_LEN_L, SP_DATA };
-static SerialParse g_sp           = SP_IDLE;
-static uint8_t     g_cmd          = 0;
-static uint16_t    g_expect_len   = 0;
-static uint16_t    g_serial_pos   = 0;
-// Buffer must hold one full CMD_DATA payload (≤ CHUNK_DATA_SIZE)
+static SerialParse g_sp         = SP_IDLE;
+static uint8_t     g_cmd        = 0;
+static uint16_t    g_expect_len = 0;
+static uint16_t    g_serial_pos = 0;
+// Must hold CMD_CHUNK_FOR: 1 (idx) + CHUNK_DATA_SIZE
 static uint8_t     g_serial_buf[CHUNK_DATA_SIZE + 8];
 
-// ======================================================
-// Serial helpers
-// ======================================================
+static const uint8_t BROADCAST[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// ── Serial helpers ────────────────────────────────────────────────────────────
 static void serialRsp(uint8_t rsp, const uint8_t *data = nullptr, uint16_t len = 0) {
   Serial.write(SERIAL_RESP);
   Serial.write(rsp);
@@ -173,19 +213,18 @@ static void serialError(uint8_t code) {
   serialRsp(RSP_ERROR, &code, 1);
 }
 
-// ======================================================
-// ESP-NOW helpers
-// ======================================================
-static bool espnowAddPeer(uint8_t *mac) {
-  if (esp_now_is_peer_exist(mac)) return true;
-  return esp_now_add_peer(mac, ESP_NOW_ROLE_COMBO, ESPNOW_CHANNEL, nullptr, 0) == 0;
+// ── ESP-NOW helpers ───────────────────────────────────────────────────────────
+static bool espnowAddPeer(const uint8_t *mac) {
+  if (esp_now_is_peer_exist((uint8_t *)mac)) return true;
+  return esp_now_add_peer((uint8_t *)mac, ESP_NOW_ROLE_COMBO,
+                          ESPNOW_CHANNEL, nullptr, 0) == 0;
 }
 
-static void espnowSend(uint8_t *mac, espnow_msg_t *m, uint16_t payload_len) {
-  esp_now_send(mac, (uint8_t *)m, 4 + payload_len);
+static void espnowSend(const uint8_t *mac, espnow_msg_t *m, uint16_t payload_len) {
+  esp_now_send((uint8_t *)mac, (uint8_t *)m, 4 + payload_len);
 }
 
-static void sendSimple(uint8_t *mac, uint8_t type, uint8_t seq = 0) {
+static void sendSimpleTo(const uint8_t *mac, uint8_t type, uint8_t seq = 0) {
   espnow_msg_t m;
   m.type = type;
   m.seq  = seq;
@@ -193,14 +232,67 @@ static void sendSimple(uint8_t *mac, uint8_t type, uint8_t seq = 0) {
   espnowSend(mac, &m, 0);
 }
 
-// ======================================================
-// ESP-NOW callbacks
-// ======================================================
+// ── Peer list helpers ─────────────────────────────────────────────────────────
+static OtaPeer *findOtaPeer(const uint8_t *mac) {
+  for (uint8_t i = 0; i < g_peer_count; i++)
+    if (memcmp(g_peers[i].mac, mac, 6) == 0) return &g_peers[i];
+  return nullptr;
+}
+
+static OtaPeer *addOtaPeer(const uint8_t *mac) {
+  if (g_peer_count >= MAX_PEERS) return nullptr;
+  if (g_peer_count == 0) g_first_peer_ms = millis();
+  OtaPeer *p = &g_peers[g_peer_count++];
+  memset(p, 0, sizeof(OtaPeer));
+  memcpy(p->mac, mac, 6);
+  p->phase = PEER_WAIT_OFFER;
+  espnowAddPeer(mac);
+  g_flash_until = millis() + 600;  // diagnostic: long flash = peer actually registered
+  return p;
+}
+
+// ── Send current chunk to a specific device (unicast) ────────────────────────
+static void sendChunkTo(OtaPeer *p) {
+  espnow_msg_t m;
+  m.type = MSG_OTA_DATA;
+  m.seq  = p->seq;
+
+  ota_data_t *dp = (ota_data_t *)m.payload;
+  dp->offset   = p->chunk_offset;
+  dp->data_len = p->chunk_len;
+  memcpy(dp->data, p->chunk_buf, p->chunk_len);
+
+  uint16_t pay = (uint16_t)(sizeof(ota_data_t) - CHUNK_DATA_SIZE + p->chunk_len);
+  m.len = pay;
+  espnowSend(p->mac, &m, pay);  // unicast — only this device gets it
+
+  p->timer       = millis();
+  g_flash_until  = p->timer + CHUNK_FLASH_MS;
+}
+
+// ── Request next chunk for a peer from the PC ─────────────────────────────────
+static void requestChunkFor(uint8_t idx) {
+  OtaPeer *p = &g_peers[idx];
+  uint8_t  payload[5];
+  payload[0] = idx;
+  memcpy(payload + 1, &p->bytes_acked, 4);
+  serialRsp(RSP_NEED_CHUNK, payload, 5);
+  p->phase  = PEER_WAIT_PC;
+  p->timer  = millis();
+  g_pc_busy = true;
+}
+
+// ── ESP-NOW callbacks ─────────────────────────────────────────────────────────
 static void ICACHE_RAM_ATTR onEspNowReceive(uint8_t *mac, uint8_t *data, uint8_t len) {
+  // Diagnostic: flash the LED on ANY received ESP-NOW packet, independent of
+  // protocol state — lets you visually confirm the radio is hearing something
+  // without needing the serial link (which is reserved for the PC protocol).
+  g_flash_until = millis() + 120;
+
   if (g_msg_pending) return;
   memcpy(g_msg_mac, mac, 6);
   memcpy(g_msg_buf, data, len);
-  g_msg_len = len;
+  g_msg_len     = len;
   g_msg_pending = true;
 }
 
@@ -208,111 +300,153 @@ static void onEspNowSent(uint8_t *mac, uint8_t status) {
   (void)mac; (void)status;
 }
 
-// ======================================================
-// Process one received ESP-NOW message  (main loop)
-// ======================================================
+// ── Process one ESP-NOW message ───────────────────────────────────────────────
 static void processEspNowMsg() {
   if (!g_msg_pending) return;
   const espnow_msg_t *m = (const espnow_msg_t *)g_msg_buf;
 
   switch (m->type) {
+
     case MSG_BEACON:
-      if (g_state == S_WAIT_DEVICE && !g_device_found) {
-        memcpy(g_peer_mac, g_msg_mac, 6);
-        g_device_found = true;
+      if (g_state == S_DISCOVERY) {
+        if (!findOtaPeer(g_msg_mac))
+          addOtaPeer(g_msg_mac);
       }
       break;
-    case MSG_OTA_ACCEPT:  g_offer_accepted = true; break;
+
+    case MSG_OTA_ACCEPT:
+      if (g_state == S_OFFERING) {
+        OtaPeer *p = findOtaPeer(g_msg_mac);
+        if (p && !p->responded) {
+          p->responded = true;
+          p->active    = true;
+          p->phase     = PEER_NEED_CHUNK;
+          g_active_count++;
+        }
+      }
+      break;
+
     case MSG_OTA_REJECT:
-      g_reject_reason  = (m->len >= 1) ? m->payload[0] : 0;
-      g_offer_rejected = true;
+      if (g_state == S_OFFERING) {
+        OtaPeer *p = findOtaPeer(g_msg_mac);
+        if (p && !p->responded) {
+          p->responded = true;
+          p->phase     = PEER_ERROR;
+          if (m->len >= 1) {
+            if (m->payload[0] == 0x01)
+              serialRsp(RSP_VERSION_MATCH,  g_msg_mac, 6);
+            else if (m->payload[0] == 0x02)
+              serialRsp(RSP_TYPE_MISMATCH, g_msg_mac, 6);
+          }
+        }
+      }
       break;
-    case MSG_OTA_ACK:
-      if (m->seq == g_seq) g_ack_received = true;
+
+    case MSG_OTA_ACK: {
+      OtaPeer *p = findOtaPeer(g_msg_mac);
+      if (p && p->active && p->phase == PEER_WAIT_ACK && m->seq == p->seq) {
+        p->retries     = 0;
+        p->bytes_acked += p->chunk_len;
+        if (p->bytes_acked >= g_firmware_size) {
+          p->phase = PEER_SEND_END;   // handled in state machine
+        } else {
+          p->seq   = (p->seq + 1) & 0xFF;
+          p->phase = PEER_NEED_CHUNK;
+        }
+      }
       break;
-    case MSG_OTA_NAK:
-      g_nak_received = true;
+    }
+
+    case MSG_OTA_NAK: {
+      OtaPeer *p = findOtaPeer(g_msg_mac);
+      if (p && p->active && p->phase == PEER_WAIT_ACK) {
+        if (++p->retries > MAX_RETRIES) {
+          p->phase = PEER_ERROR;
+          uint8_t pl[2] = { (uint8_t)(p - g_peers), ERR_TARGET_FLASH };
+          serialRsp(RSP_DEVICE_DONE, pl, 2);
+        } else {
+          sendChunkTo(p);
+        }
+      }
       break;
-    case MSG_OTA_DONE:
-      g_done_status = (m->len >= 1) ? m->payload[0] : 0;
-      g_ota_done = true;
+    }
+
+    case MSG_OTA_DONE: {
+      OtaPeer *p = findOtaPeer(g_msg_mac);
+      if (p && p->active && p->phase == PEER_WAIT_DONE) {
+        p->done_status = (m->len >= 1) ? m->payload[0] : 0;
+        p->phase       = PEER_DONE;
+        uint8_t pl[2]  = { (uint8_t)(p - g_peers), p->done_status };
+        serialRsp(RSP_DEVICE_DONE, pl, 2);
+      }
       break;
-    default: break;
+    }
+
+    default:
+      break;
   }
+
   g_msg_pending = false;
 }
 
-// ======================================================
-// Send (or re-send) the currently buffered chunk
-// ======================================================
-static void sendCurrentChunk() {
-  espnow_msg_t m;
-  m.type = MSG_OTA_DATA;
-  m.seq  = g_seq;
-
-  ota_data_t *dp = (ota_data_t *)m.payload;
-  dp->offset   = g_chunk_offset;
-  dp->data_len = g_chunk_len;
-  memcpy(dp->data, g_chunk_buf, g_chunk_len);
-
-  // payload = offset(4) + data_len(2) + data(g_chunk_len)
-  uint16_t pay = (uint16_t)(sizeof(ota_data_t) - CHUNK_DATA_SIZE + g_chunk_len);
-  m.len = pay;
-  espnowSend(g_peer_mac, &m, pay);
-
-  g_ack_received = false;
-  g_nak_received = false;
-  g_timer = millis();
-}
-
-// ======================================================
-// Serial command processor
-// ======================================================
+// ── Serial command processor ──────────────────────────────────────────────────
 static void processSerialCmd(uint8_t cmd, const uint8_t *data, uint16_t len) {
   switch (cmd) {
 
     case CMD_INIT: {
+      // Expected: [fw_size:4LE][crc32:4LE][version:4LE][flags:1][device_type:12][discovery_ms:4LE] = 29 bytes
       if (g_state != S_IDLE) { serialError(ERR_BUSY); return; }
-      if (len < 12)          { serialError(ERR_BUSY); return; }
+      if (len < 29)          { serialError(ERR_BUSY); return; }
       memcpy(&g_firmware_size,    data,      4);
-      memcpy(&g_firmware_crc,     data + 4,  4);
-      memcpy(&g_firmware_version, data + 8,  4);
-      g_firmware_flags = (len >= 13) ? data[12] : 0;
-      g_bytes_acked  = 0;
-      g_seq          = 0;
-      g_device_found = false;
-      g_state        = S_WAIT_DEVICE;
+      memcpy(&g_firmware_crc,     data +  4, 4);
+      memcpy(&g_firmware_version, data +  8, 4);
+      g_firmware_flags = data[12];
+      memcpy(g_firmware_type,     data + 13, 12);
+      g_firmware_type[11] = '\0';  // safety: ensure null-terminated for print
+      memcpy(&g_discovery_window_ms, data + 25, 4);
+
+      memset(g_peers, 0, sizeof(g_peers));
+      g_peer_count   = 0;
+      g_active_count = 0;
+      g_pc_busy      = false;
+      g_timer        = millis();
+      g_state        = S_DISCOVERY;
       serialRsp(RSP_OK);
       break;
     }
 
-    case CMD_DATA: {
-      if (g_state != S_WAIT_PC_CHUNK)        { serialError(ERR_BUSY); return; }
-      if (len == 0 || len > CHUNK_DATA_SIZE) { serialError(ERR_BUSY); return; }
-      g_chunk_offset = g_bytes_acked;
-      g_chunk_len    = len;
-      memcpy(g_chunk_buf, data, len);
-      g_retries = 0;
-      g_state   = S_WAIT_ACK;
-      sendCurrentChunk();
+    case CMD_CHUNK_FOR: {
+      // PC delivers chunk data for a specific device
+      if (g_state != S_STREAMING || !g_pc_busy) { serialError(ERR_BUSY); return; }
+      if (len < 2 || len > CHUNK_DATA_SIZE + 1)  { serialError(ERR_BUSY); return; }
+
+      uint8_t idx = data[0];
+      if (idx >= g_peer_count) { serialError(ERR_BUSY); return; }
+      OtaPeer *p = &g_peers[idx];
+      if (p->phase != PEER_WAIT_PC) { serialError(ERR_BUSY); return; }
+
+      uint16_t chunk_len = len - 1;
+      p->chunk_offset = p->bytes_acked;
+      p->chunk_len    = chunk_len;
+      memcpy(p->chunk_buf, data + 1, chunk_len);
+      p->retries  = 0;
+      p->phase    = PEER_WAIT_ACK;
+      g_pc_busy   = false;
+      sendChunkTo(p);
       break;
     }
 
     case CMD_STATUS: {
-      uint8_t s[2] = {
-        (uint8_t)g_state,
-        (g_firmware_size > 0)
-          ? (uint8_t)((g_bytes_acked * 100UL) / g_firmware_size)
-          : 0
-      };
+      uint8_t s[2] = { (uint8_t)g_state, 0 };
       serialRsp(RSP_OK, s, 2);
       break;
     }
 
     case CMD_CANCEL: {
-      if (g_state >= S_WAIT_PC_CHUNK)
-        sendSimple(g_peer_mac, MSG_OTA_ERROR);
-      g_state = S_IDLE;
+      if (g_state >= S_STREAMING)
+        sendSimpleTo(BROADCAST, MSG_OTA_ERROR);
+      g_state   = S_IDLE;
+      g_pc_busy = false;
       serialRsp(RSP_OK);
       break;
     }
@@ -323,9 +457,7 @@ static void processSerialCmd(uint8_t cmd, const uint8_t *data, uint16_t len) {
   }
 }
 
-// ======================================================
-// Serial framing parser  (one byte at a time)
-// ======================================================
+// ── Serial framing parser ─────────────────────────────────────────────────────
 static void handleSerialByte(uint8_t b) {
   switch (g_sp) {
     case SP_IDLE:
@@ -360,15 +492,24 @@ static void handleSerialByte(uint8_t b) {
   }
 }
 
-// ======================================================
-// OTA state machine  (called from loop)
-// ======================================================
+// ── OTA state machine ─────────────────────────────────────────────────────────
 static void handleStateMachine() {
   switch (g_state) {
 
-    case S_WAIT_DEVICE:
-      if (g_device_found) {
-        espnowAddPeer(g_peer_mac);
+    // ── Discovery: collect beacons until window expires, or — once the first
+    //    peer is heard — until a short settle period passes (the target only
+    //    listens for a reply for its own brief OTA_WINDOW_MS, so we can't sit
+    //    on a found peer for the rest of a multi-minute discovery window) ────
+    case S_DISCOVERY: {
+      bool windowExpired = (millis() - g_timer >= g_discovery_window_ms);
+      bool settled = (g_peer_count > 0) &&
+                     (millis() - g_first_peer_ms >= DISCOVERY_SETTLE_MS);
+      if (windowExpired || settled) {
+        if (g_peer_count == 0) {
+          serialError(ERR_TIMEOUT);
+          g_state = S_IDLE;
+          break;
+        }
         espnow_msg_t m;
         m.type = MSG_OTA_OFFER;
         m.seq  = 0;
@@ -378,84 +519,136 @@ static void handleStateMachine() {
         off->chunk_size      = CHUNK_DATA_SIZE;
         off->offered_version = g_firmware_version;
         off->flags           = g_firmware_flags;
+        memcpy(off->device_type, g_firmware_type, 12);
         m.len = sizeof(ota_offer_t);
-        espnowSend(g_peer_mac, &m, sizeof(ota_offer_t));
-        g_offer_accepted = false;
-        g_offer_rejected = false;
+        espnowSend(BROADCAST, &m, sizeof(ota_offer_t));
         g_timer = millis();
         g_state = S_OFFERING;
       }
       break;
+    }
 
-    case S_OFFERING:
-      if (g_offer_accepted) {
-        serialRsp(RSP_DEVICE_FOUND, g_peer_mac, 6);
-        serialRsp(RSP_READY_DATA);
-        g_state = S_WAIT_PC_CHUNK;
-      } else if (g_offer_rejected) {
-        if (g_reject_reason == 0x01) {
-          // Target already runs this version — inform PC, keep listening
-          serialRsp(RSP_VERSION_MATCH, g_peer_mac, 6);
-        }
-        g_device_found = false;
-        g_state = S_WAIT_DEVICE;
-      } else if (millis() - g_timer > OFFER_TIMEOUT_MS) {
-        g_device_found = false;
-        g_state = S_WAIT_DEVICE;
-      }
-      break;
+    // ── Offering: collect accepts/rejects ─────────────────────────────────
+    case S_OFFERING: {
+      uint8_t responded = 0;
+      for (uint8_t i = 0; i < g_peer_count; i++)
+        if (g_peers[i].responded) responded++;
 
-    case S_WAIT_ACK:
-      if (g_ack_received) {
-        g_ack_received = false;
-        g_retries      = 0;
-        g_bytes_acked += g_chunk_len;
+      bool all_responded = (responded >= g_peer_count);
+      bool timed_out     = (millis() - g_timer > OFFER_COLLECT_MS);
 
-        if (g_bytes_acked >= g_firmware_size) {
-          sendSimple(g_peer_mac, MSG_OTA_END, g_seq);
-          g_timer = millis();
-          g_state = S_WAIT_DONE;
-        } else {
-          g_seq = (g_seq + 1) & 0xFF;
-          serialRsp(RSP_READY_DATA);
-          g_state = S_WAIT_PC_CHUNK;
+      if (g_active_count > 0 && (all_responded || timed_out)) {
+        // Report each accepting device to PC with its index
+        for (uint8_t i = 0; i < g_peer_count; i++) {
+          if (!g_peers[i].active) continue;
+          uint8_t pl[7];
+          pl[0] = i;
+          memcpy(pl + 1, g_peers[i].mac, 6);
+          serialRsp(RSP_DEVICE_FOUND, pl, 7);
         }
-      } else if (g_nak_received || (millis() - g_timer > ACK_TIMEOUT_MS)) {
-        g_nak_received = false;
-        if (++g_retries > MAX_RETRIES) {
-          g_state = S_IDLE;
-          serialError(ERR_TIMEOUT);
-        } else {
-          sendCurrentChunk();  // resend same chunk, g_bytes_acked unchanged
-        }
-      }
-      break;
-
-    case S_WAIT_DONE:
-      if (g_ota_done) {
-        g_ota_done = false;
-        g_state    = S_IDLE;
-        if (g_done_status == 0) {
-          serialRsp(RSP_COMPLETE);
-        } else {
-          serialError(g_done_status ? g_done_status : ERR_TARGET_FLASH);
-        }
-      } else if (millis() - g_timer > DONE_TIMEOUT_MS) {
+        g_state = S_STREAMING;
+        // Don't send RSP_READY_DATA — first RSP_NEED_CHUNK signals streaming start
+      } else if (g_active_count == 0 && timed_out) {
+        serialError(ERR_REJECTED);
         g_state = S_IDLE;
-        serialError(ERR_TIMEOUT);
       }
       break;
+    }
+
+    // ── Streaming: run per-device state machines ──────────────────────────
+    case S_STREAMING: {
+      uint8_t finished = 0;
+
+      for (uint8_t i = 0; i < g_peer_count; i++) {
+        OtaPeer *p = &g_peers[i];
+        if (!p->active) continue;
+
+        switch (p->phase) {
+
+          case PEER_NEED_CHUNK:
+            // Request next chunk from PC — but only one request outstanding at a time
+            if (!g_pc_busy)
+              requestChunkFor(i);
+            break;
+
+          case PEER_WAIT_PC:
+            // Timeout if PC doesn't respond (shouldn't happen on USB serial)
+            if (millis() - p->timer > PC_CHUNK_TIMEOUT_MS) {
+              g_pc_busy = false;
+              requestChunkFor(i);  // re-request
+            }
+            break;
+
+          case PEER_WAIT_ACK:
+            if (millis() - p->timer > ACK_TIMEOUT_MS) {
+              if (++p->retries > MAX_RETRIES) {
+                p->phase = PEER_ERROR;
+                uint8_t pl[2] = { i, ERR_TIMEOUT };
+                serialRsp(RSP_DEVICE_DONE, pl, 2);
+              } else {
+                sendChunkTo(p);  // unicast retry to this device only
+              }
+            }
+            break;
+
+          case PEER_SEND_END:
+            sendSimpleTo(p->mac, MSG_OTA_END, p->seq);
+            p->phase = PEER_WAIT_DONE;
+            p->timer = millis();
+            break;
+
+          case PEER_WAIT_DONE:
+            if (millis() - p->timer > DONE_TIMEOUT_MS) {
+              p->phase = PEER_ERROR;
+              uint8_t pl[2] = { i, ERR_TIMEOUT };
+              serialRsp(RSP_DEVICE_DONE, pl, 2);
+            }
+            break;
+
+          case PEER_DONE:
+          case PEER_ERROR:
+            finished++;
+            break;
+
+          default:
+            break;
+        }
+      }
+
+      // All active devices have finished (done or error)
+      if (finished >= g_active_count) {
+        g_state = S_IDLE;
+        serialRsp(RSP_COMPLETE);
+      }
+      break;
+    }
 
     default:
       break;
   }
 }
 
-// ======================================================
-// Arduino entry points
-// ======================================================
+// ── LED driver ────────────────────────────────────────────────────────────────
+static void updateLed() {
+  uint32_t now = millis();
+  bool streaming = (g_state == S_STREAMING);
+
+  if (streaming || now < g_flash_until) {
+    analogWrite(PIN_LED, (now < g_flash_until) ? 0 : 1023);
+  } else {
+    static const float kFactor = 2.0f * (float)M_PI / (float)BREATHE_PERIOD_MS;
+    float    phase = (float)(now % (uint32_t)BREATHE_PERIOD_MS) * kFactor;
+    uint16_t val   = (uint16_t)((1.0f - cosf(phase)) * 511.5f);
+    analogWrite(PIN_LED, 1023 - val);
+  }
+}
+
+// ── Arduino entry points ──────────────────────────────────────────────────────
 void setup() {
   Serial.begin(921600);
+
+  pinMode(PIN_LED, OUTPUT);
+  analogWrite(PIN_LED, 1023);
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -472,9 +665,7 @@ void setup() {
   esp_now_register_recv_cb(onEspNowReceive);
   esp_now_register_send_cb(onEspNowSent);
 
-  // Broadcast peer — needed to hear incoming beacons from unknown MACs
-  uint8_t bc[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
-  esp_now_add_peer(bc, ESP_NOW_ROLE_COMBO, ESPNOW_CHANNEL, nullptr, 0);
+  esp_now_add_peer((uint8_t *)BROADCAST, ESP_NOW_ROLE_COMBO, ESPNOW_CHANNEL, nullptr, 0);
 
   serialRsp(RSP_OK);
 }
@@ -485,4 +676,5 @@ void loop() {
 
   processEspNowMsg();
   handleStateMachine();
+  updateLed();
 }
