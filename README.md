@@ -1,6 +1,12 @@
 # ESP-NOW_OTA
 
-An ESP-NOW OTA updater that can remotely update ESP8266 devices in the field over ESP-NOW — no WiFi router required.
+An ESP-NOW OTA updater that can remotely update ESP8266 devices in the field over ESP-NOW — no WiFi router required.    
+   
+This code can be adapted to work on the ESP32 variants, but I don't have the use-case for it yet, unless you can test and make a PR, it would be appreciated, or I can update the code to work on a ESP32, but compatibility will be limited, as I cannot test all variants and flash sizes of the ESP32, nor the ESP8266.  
+
+   
+This code has been confirmed to be working on ESP12-F and generic ESP8266 boards, with 1MB of flash.
+
 
 > **Disclaimer:** I am not responsible for any damage or data loss. Use this code at your own risk.
 > This is a proof of concept, vibe-coded with [Claude Code](https://claude.ai/code).
@@ -19,7 +25,9 @@ It consists of three parts:
 | **Receiver** | ESP8266 (target device) | Beacons on boot, accepts/flashes firmware |
 | **PC Tool** | Python script | Reads `.bin`, streams it to sender over serial |
 
-The sender can update **multiple targets in a single session** (up to 5), each streamed independently at its own pace — a slow or retry-heavy device never holds back the others.
+The sender can update **multiple targets in a single session** (up to 5), each streamed independently at its own pace — a slow or retry-heavy device never holds back the others.   
+
+You are limited to the serial link data-rates, so the data transfer will slow down for more than one-device, as the blocks are streamed individually over the serial link, but in my tests, an ESP-NOW OTA update seems to be much faster than the normal serial port upload.
 
 ---
 
